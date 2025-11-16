@@ -1,0 +1,215 @@
+blueprint:
+  name: ESPresense - BLE Exit Detection
+  description: Tracks a device exiting through a specific exit node and manages away timers; only timers mark away. Uses virtual.move instead of device_tracker.see and dynamic home GPS.
+  domain: automation
+
+  input:
+    ble_sensor:
+      name: BLE Device to monitor
+      description: The device enrolled with ESPresence to track
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+
+    exit_node_state:
+      name: Exit Node State Value
+      default: "frontyard"
+      selector:
+        select:
+          options:
+            - "frontyard"
+            - "backyard"
+            - "downstairs"
+            - "upstairs"
+
+    pending_exit_toggle:
+      name: Pending Exit Toggle
+      selector:
+        entity:
+          filter:
+            - domain: input_boolean
+
+    away_timer:
+      name: Away Timer
+      selector:
+        entity:
+          filter:
+            - domain: timer
+
+    timer_duration:
+      name: Timer Duration
+      default: "00:10:00"
+      selector:
+        text:
+
+variables:
+  exit_node: !input exit_node_state
+  pending_exit: !input pending_exit_toggle
+  dev_id: !input ble_sensor
+  home_lat: "{{ state_attr('zone.home', 'latitude') }}"
+  home_lon: "{{ state_attr('zone.home', 'longitude') }}"
+
+triggers:
+  - id: ble_update
+    platform: state
+    entity_id: !input ble_sensor
+    from: ~
+    to: ~
+
+  - id: timer_finished
+    platform: event
+    event_type: timer.finished
+    event_data:
+      entity_id: !input away_timer
+
+  - id: periodic_check
+    platform: time_pattern
+    seconds: "/30"
+
+actions:
+  - choose:
+      - alias: Arrival — exit node after being not_home
+        conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'ble_update'
+                 and trigger.to_state.state == exit_node
+                 and trigger.from_state is not none
+                 and trigger.from_state.state == 'not_home' }}
+        sequence:
+          - action: virtual.move
+            target:
+              entity_id: "{{ dev_id.replace('sensor.', 'device_tracker.') }}"
+            data:
+              location: home
+              gps:
+                latitude: "{{ home_lat }}"
+                longitude: "{{ home_lon }}"
+          - service: timer.cancel
+            target:
+              entity_id: !input away_timer
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input pending_exit_toggle
+
+      - alias: Exit path — exit node coming from inside
+        conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'ble_update'
+                 and trigger.to_state.state == exit_node
+                 and trigger.from_state is not none
+                 and trigger.from_state.state != 'not_home' }}
+        sequence:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: !input pending_exit_toggle
+
+      - alias: Device moved indoors — cancel pending exit
+        conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'ble_update'
+                 and trigger.to_state.state not in [exit_node, 'not_home']
+                 and is_state(pending_exit, 'on') }}
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input pending_exit_toggle
+
+      - alias: Device left while pending exit — start timer
+        conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'ble_update'
+                 and trigger.to_state.state == 'not_home'
+                 and is_state(pending_exit, 'on') }}
+        sequence:
+          - service: timer.start
+            target:
+              entity_id: !input away_timer
+            data:
+              duration: !input timer_duration
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input pending_exit_toggle
+
+      - alias: Timer finished — confirm not_home
+        conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'timer_finished' }}"
+        sequence:
+          - action: virtual.move
+            target:
+              entity_id: "{{ dev_id.replace('sensor.', 'device_tracker.') }}"
+            data:
+              location: not_home
+
+      - alias: Device comes home indoors — cancel timer & mark home
+        conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'ble_update'
+                 and trigger.to_state.state not in ['not_home', exit_node] }}
+        sequence:
+          - action: virtual.move
+            target:
+              entity_id: "{{ dev_id.replace('sensor.', 'device_tracker.') }}"
+            data:
+              location: home
+              gps:
+                latitude: "{{ home_lat }}"
+                longitude: "{{ home_lon }}"
+          - service: timer.cancel
+            target:
+              entity_id: !input away_timer
+
+      - alias: Periodic check — mark home or not_home
+        conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'periodic_check' }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states(dev_id) == exit_node }}
+                sequence:
+                  - service: input_boolean.turn_on
+                    target:
+                      entity_id: !input pending_exit_toggle
+
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states(dev_id) not in ['not_home', exit_node] }}
+                sequence:
+                  - action: virtual.move
+                    target:
+                      entity_id: "{{ dev_id.replace('sensor.', 'device_tracker.') }}"
+                    data:
+                      location: home
+                      gps:
+                        latitude: "{{ home_lat }}"
+                        longitude: "{{ home_lon }}"
+                  - service: timer.cancel
+                    target:
+                      entity_id: !input away_timer
+                  - service: input_boolean.turn_off
+                    target:
+                      entity_id: !input pending_exit_toggle
+
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ states(dev_id) == 'not_home' }}
+                sequence:
+                  - action: virtual.move
+                    target:
+                      entity_id: "{{ dev_id.replace('sensor.', 'device_tracker.') }}"
+                    data:
+                      location: not_home
+
+mode: parallel
+max: 20
